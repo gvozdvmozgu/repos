@@ -1,0 +1,20 @@
+query($ids: [ID!]!) {
+    nodes(ids: $ids) {
+        ... on Repository {
+            id
+            nameWithOwner
+            defaultBranchRef {
+                name
+            }
+            languages(first: 100, orderBy: { field: SIZE, direction: DESC }) {
+                nodes {
+                    name
+                }
+            }
+        }
+    }
+
+    rateLimit {
+        cost
+    }
+}
