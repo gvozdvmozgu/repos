@@ -42,8 +42,8 @@ mod app {
         let mut json = std::fs::File::options()
             .create(true)
             .append(true)
-            .open("repos.json")
-            .wrap_err("Failed to open repos.json")?;
+            .open("repos.jsonl")
+            .wrap_err("Failed to open repos.jsonl")?;
 
         loop {
             let repos = repositories::fetch(token, last_id.load(Ordering::Relaxed))
