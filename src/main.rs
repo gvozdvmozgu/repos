@@ -1,28 +1,78 @@
-#![warn(unreachable_pub)]
+#![warn(unreachable_pub, unused_qualifications)]
 
 const REPOS_PER_BATCH: usize = 100;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use color_eyre::eyre::Context as _;
 
 fn main() -> color_eyre::Result<()> {
-    let mut last_id = id::load()?;
-    let mut outcome = run(&mut last_id);
+    let last_id = Arc::new(AtomicU64::new(id::load()?));
+    let token = env::required::<String>("GITHUB_TOKEN")?;
 
-    if let Err(run_error) = id::save(last_id) {
-        outcome = outcome.map_err(|report| report.wrap_err(run_error));
+    let my_id = last_id.clone();
+    ctrlc::set_handler(move || {
+        let id = my_id.load(Ordering::Relaxed);
+        let _ = id::save(id);
+
+        std::process::exit(0);
+    })
+    .unwrap();
+
+    let mut outcome = app::run(&token, last_id.clone());
+
+    if let Err(save_fail) = id::save(last_id.load(Ordering::Relaxed)) {
+        outcome = outcome.map_err(|report| report.wrap_err(save_fail));
     }
 
     outcome.wrap_err("Failed to run")
 }
 
-fn run(last_id: &mut u64) -> color_eyre::Result<()> {
-    loop {
-        let repos = repositories::fetch(*last_id).wrap_err("Failed to fetch repositories")?;
-        for repos in repos.chunks(REPOS_PER_BATCH) {
-            let ids = repos.iter().map(|repo| repo.id).collect::<Vec<_>>();
-            repositories::info(&ids).wrap_err("Failed to fetch repository info")?;
+mod app {
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-            *last_id = *ids.last().unwrap();
+    use color_eyre::eyre::Context as _;
+
+    use crate::{REPOS_PER_BATCH, repositories};
+
+    pub(crate) fn run(token: &str, last_id: Arc<AtomicU64>) -> color_eyre::Result<()> {
+        let mut json = std::fs::File::options()
+            .create(true)
+            .append(true)
+            .open("repos.json")
+            .wrap_err("Failed to open repos.json")?;
+
+        loop {
+            let since = last_id.load(Ordering::Relaxed);
+
+            let repos = repositories::fetch(since).wrap_err("Failed to fetch repositories")?;
+
+            for batch in repos.chunks(REPOS_PER_BATCH) {
+                let ids = batch
+                    .iter()
+                    .map(|repo| repo.node_id.as_str())
+                    .collect::<Vec<_>>();
+
+                let graph_repos = repositories::info(token, &ids)
+                    .wrap_err("Failed to fetch repository info")?
+                    .into_iter()
+                    .flatten();
+
+                for repo in graph_repos {
+                    let (_, _, id) =
+                        repositories::parse_node_id(&repo.id).expect("Invalid node_id format");
+
+                    let serialized = serde_json::to_string(&repo).unwrap();
+                    json.write_all(serialized.as_bytes())
+                        .wrap_err("Failed to write repository info to file")?;
+                    json.write_all(b"\n").wrap_err("Failed to write newline")?;
+
+                    last_id.store(id, Ordering::Relaxed);
+                }
+            }
         }
     }
 }
@@ -48,11 +98,32 @@ mod id {
 mod repositories {
     use color_eyre::eyre::Context as _;
 
+    use crate::types;
+
     const GITHUB_REPOSITORIES: &str = "https://api.github.com/repositories";
     const GITHUB_GRAPHQL: &str = "https://api.github.com/graphql";
     const GRAPHQL_QUERY_REPOSITORIES: &str = include_str!("../repos.graphql");
 
-    pub(crate) fn fetch(last_id: u64) -> color_eyre::Result<Vec<crate::types::Repo>> {
+    pub(crate) fn parse_node_id(encoded: &str) -> Option<(String, String, u64)> {
+        use base64::Engine as _;
+
+        let decoded_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()?;
+        let decoded = String::from_utf8(decoded_bytes).ok()?;
+
+        let mut parts = decoded.splitn(2, ':');
+        let prefix = parts.next()?.to_string();
+        let rest = parts.next()?;
+
+        let idx = rest.find(|c: char| c.is_ascii_digit())?;
+        let type_name = rest[..idx].to_string();
+
+        let numeric_id = rest[idx..].parse().ok()?;
+        Some((prefix, type_name, numeric_id))
+    }
+
+    pub(crate) fn fetch(last_id: u64) -> color_eyre::Result<Vec<types::Repo>> {
         let mut buffer = itoa::Buffer::new();
         let mut response = ureq::get(GITHUB_REPOSITORIES)
             .query("since", buffer.format(last_id))
@@ -64,12 +135,36 @@ mod repositories {
             .wrap_err("Failed to read JSON")
     }
 
-    pub(crate) fn info(ids: &[u64]) -> color_eyre::Result<Vec<String>> {
-        let _response = ureq::post(GITHUB_GRAPHQL).send_json(
-            serde_json::json!({"query": GRAPHQL_QUERY_REPOSITORIES, "variables": ids}),
-        )?;
+    pub(crate) fn info(
+        token: &str,
+        ids: &[&str],
+    ) -> color_eyre::Result<Vec<Option<types::GraphRepository>>> {
+        let mut response = ureq::post(GITHUB_GRAPHQL)
+            .header("authorization", format!("token {token}"))
+            .header("user-agent", "https://github.com/gvozdvmozgu/repos")
+            .send_json(
+                serde_json::json!({"query": GRAPHQL_QUERY_REPOSITORIES, "variables": {"ids": ids}}),
+            )?;
 
-        todo!()
+        let response: types::GraphResponse = response
+            .body_mut()
+            .read_json()
+            .wrap_err("Failed to read JSON")?;
+
+        if let Some(data) = response.data {
+            Ok(data.nodes)
+        } else {
+            let mut report = color_eyre::eyre::eyre!("GitHub returned GraphQL errors");
+            for err in response.errors.into_iter().flatten() {
+                let line = err
+                    .type_
+                    .as_ref()
+                    .map(|t| format!("[{}] {}", t, err.message))
+                    .unwrap_or_else(|| err.message.clone());
+                report = report.wrap_err(line);
+            }
+            Err(report)
+        }
     }
 }
 
@@ -79,76 +174,140 @@ mod types {
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub(crate) struct Repo {
-        pub id: u64,
-        pub node_id: String,
-        pub name: String,
-        pub full_name: String,
-        pub private: bool,
-        pub owner: Owner,
-        pub html_url: String,
-        pub description: Option<String>,
-        pub fork: bool,
-        pub url: String,
-        pub forks_url: String,
-        pub keys_url: String,
-        pub collaborators_url: String,
-        pub teams_url: String,
-        pub hooks_url: String,
-        pub issue_events_url: String,
-        pub events_url: String,
-        pub assignees_url: String,
-        pub branches_url: String,
-        pub tags_url: String,
-        pub blobs_url: String,
-        pub git_tags_url: String,
-        pub git_refs_url: String,
-        pub trees_url: String,
-        pub statuses_url: String,
-        pub languages_url: String,
-        pub stargazers_url: String,
-        pub contributors_url: String,
-        pub subscribers_url: String,
-        pub subscription_url: String,
-        pub commits_url: String,
-        pub git_commits_url: String,
-        pub comments_url: String,
-        pub issue_comment_url: String,
-        pub contents_url: String,
-        pub compare_url: String,
-        pub merges_url: String,
-        pub archive_url: String,
-        pub downloads_url: String,
-        pub issues_url: String,
-        pub pulls_url: String,
-        pub milestones_url: String,
-        pub notifications_url: String,
-        pub labels_url: String,
-        pub releases_url: String,
-        pub deployments_url: String,
+        pub(crate) id: u64,
+        pub(crate) node_id: String,
+        pub(crate) name: String,
+        pub(crate) full_name: String,
+        pub(crate) private: bool,
+        pub(crate) owner: Owner,
+        pub(crate) html_url: String,
+        pub(crate) description: Option<String>,
+        pub(crate) fork: bool,
+        pub(crate) url: String,
+        pub(crate) forks_url: String,
+        pub(crate) keys_url: String,
+        pub(crate) collaborators_url: String,
+        pub(crate) teams_url: String,
+        pub(crate) hooks_url: String,
+        pub(crate) issue_events_url: String,
+        pub(crate) events_url: String,
+        pub(crate) assignees_url: String,
+        pub(crate) branches_url: String,
+        pub(crate) tags_url: String,
+        pub(crate) blobs_url: String,
+        pub(crate) git_tags_url: String,
+        pub(crate) git_refs_url: String,
+        pub(crate) trees_url: String,
+        pub(crate) statuses_url: String,
+        pub(crate) languages_url: String,
+        pub(crate) stargazers_url: String,
+        pub(crate) contributors_url: String,
+        pub(crate) subscribers_url: String,
+        pub(crate) subscription_url: String,
+        pub(crate) commits_url: String,
+        pub(crate) git_commits_url: String,
+        pub(crate) comments_url: String,
+        pub(crate) issue_comment_url: String,
+        pub(crate) contents_url: String,
+        pub(crate) compare_url: String,
+        pub(crate) merges_url: String,
+        pub(crate) archive_url: String,
+        pub(crate) downloads_url: String,
+        pub(crate) issues_url: String,
+        pub(crate) pulls_url: String,
+        pub(crate) milestones_url: String,
+        pub(crate) notifications_url: String,
+        pub(crate) labels_url: String,
+        pub(crate) releases_url: String,
+        pub(crate) deployments_url: String,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub(crate) struct Owner {
-        pub login: String,
-        pub id: u64,
-        pub node_id: String,
-        pub avatar_url: String,
-        pub gravatar_id: String,
-        pub url: String,
-        pub html_url: String,
-        pub followers_url: String,
-        pub following_url: String,
-        pub gists_url: String,
-        pub starred_url: String,
-        pub subscriptions_url: String,
-        pub organizations_url: String,
-        pub repos_url: String,
-        pub events_url: String,
-        pub received_events_url: String,
+        pub(crate) login: String,
+        pub(crate) id: u64,
+        pub(crate) node_id: String,
+        pub(crate) avatar_url: String,
+        pub(crate) gravatar_id: String,
+        pub(crate) url: String,
+        pub(crate) html_url: String,
+        pub(crate) followers_url: String,
+        pub(crate) following_url: String,
+        pub(crate) gists_url: String,
+        pub(crate) starred_url: String,
+        pub(crate) subscriptions_url: String,
+        pub(crate) organizations_url: String,
+        pub(crate) repos_url: String,
+        pub(crate) events_url: String,
+        pub(crate) received_events_url: String,
         #[serde(rename = "type")]
-        pub owner_type: String,
-        pub user_view_type: String,
-        pub site_admin: bool,
+        pub(crate) owner_type: String,
+        pub(crate) user_view_type: String,
+        pub(crate) site_admin: bool,
+    }
+
+    #[derive(Deserialize)]
+    pub(crate) struct GraphResponse {
+        pub(crate) data: Option<GraphRepositories>,
+        pub(crate) errors: Option<Vec<GitHubError>>,
+        #[allow(dead_code)]
+        pub(crate) message: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    pub(crate) struct GitHubError {
+        pub(crate) message: String,
+        #[serde(rename = "type")]
+        pub(crate) type_: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub(crate) struct GraphRepositories {
+        pub(crate) nodes: Vec<Option<GraphRepository>>,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub(crate) struct GraphRepository {
+        pub(crate) id: String,
+        pub(crate) name_with_owner: String,
+        pub(crate) default_branch_ref: Option<GraphRef>,
+        pub(crate) languages: GraphLanguages,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    pub(crate) struct GraphLanguages {
+        pub(crate) nodes: Vec<Option<GraphLanguage>>,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    pub(crate) struct GraphLanguage {
+        pub(crate) name: String,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    pub(crate) struct GraphRef {
+        pub(crate) name: String,
+    }
+}
+
+mod env {
+    pub(crate) fn required<T: std::str::FromStr>(key: &str) -> color_eyre::Result<T>
+    where
+        T::Err: std::fmt::Display,
+    {
+        std::env::var(key)
+            .map_err(|error| {
+                color_eyre::eyre::eyre!(
+                    "Failed to find required {key} environment variable: {error}"
+                )
+            })
+            .and_then(|value| {
+                value.parse::<T>().map_err(|error| {
+                    color_eyre::eyre::eyre!("Failed to parse {key} environment variable: {error}")
+                })
+            })
     }
 }

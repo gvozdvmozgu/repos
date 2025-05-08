@@ -13,8 +13,4 @@ query($ids: [ID!]!) {
             }
         }
     }
-
-    rateLimit {
-        cost
-    }
 }
