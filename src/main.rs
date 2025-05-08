@@ -46,9 +46,8 @@ mod app {
             .wrap_err("Failed to open repos.json")?;
 
         loop {
-            let since = last_id.load(Ordering::Relaxed);
-
-            let repos = repositories::fetch(since).wrap_err("Failed to fetch repositories")?;
+            let repos = repositories::fetch(token, last_id.load(Ordering::Relaxed))
+                .wrap_err("Failed to fetch repositories")?;
 
             for batch in repos.chunks(REPOS_PER_BATCH) {
                 let ids = batch
@@ -100,9 +99,34 @@ mod repositories {
 
     use crate::types;
 
-    const GITHUB_REPOSITORIES: &str = "https://api.github.com/repositories";
-    const GITHUB_GRAPHQL: &str = "https://api.github.com/graphql";
+    const GITHUB_API: &str = "https://api.github.com/";
     const GRAPHQL_QUERY_REPOSITORIES: &str = include_str!("../repos.graphql");
+
+    macro_rules! request {
+        (get, $token:expr, $path:expr $(, $call:ident ( $($args:tt)* ) )* ) => {{
+            let mut req = ureq::get(&format!("{}{}", GITHUB_API, $path));
+
+            req = req
+                .header("authorization", &format!("token {}", $token))
+                .header("user-agent", "https://github.com/gvozdvmozgu/repos");
+
+            $(
+                req = req.$call($($args)*);
+            )*
+            req
+        }};
+
+        (post, $token:expr, $path:expr $(, $call:ident ( $($args:tt)* ) )* ) => {{
+            let mut req = ureq::post(&format!("{}{}", GITHUB_API, $path));
+            req = req
+                .header("authorization", &format!("token {}", $token))
+                .header("user-agent", "https://github.com/gvozdvmozgu/repos");
+            $(
+                req = req.$call($($args)*);
+            )*
+            req
+        }};
+    }
 
     pub(crate) fn parse_node_id(encoded: &str) -> Option<(String, String, u64)> {
         use base64::Engine as _;
@@ -123,9 +147,9 @@ mod repositories {
         Some((prefix, type_name, numeric_id))
     }
 
-    pub(crate) fn fetch(last_id: u64) -> color_eyre::Result<Vec<types::Repo>> {
+    pub(crate) fn fetch(token: &str, last_id: u64) -> color_eyre::Result<Vec<types::Repo>> {
         let mut buffer = itoa::Buffer::new();
-        let mut response = ureq::get(GITHUB_REPOSITORIES)
+        let mut response = request!(get, token, "repositories")
             .query("since", buffer.format(last_id))
             .call()?;
 
@@ -139,12 +163,9 @@ mod repositories {
         token: &str,
         ids: &[&str],
     ) -> color_eyre::Result<Vec<Option<types::GraphRepository>>> {
-        let mut response = ureq::post(GITHUB_GRAPHQL)
-            .header("authorization", format!("token {token}"))
-            .header("user-agent", "https://github.com/gvozdvmozgu/repos")
-            .send_json(
-                serde_json::json!({"query": GRAPHQL_QUERY_REPOSITORIES, "variables": {"ids": ids}}),
-            )?;
+        let mut response = request!(post, token, "graphql").send_json(
+            serde_json::json!({"query": GRAPHQL_QUERY_REPOSITORIES, "variables": {"ids": ids}}),
+        )?;
 
         let response: types::GraphResponse = response
             .body_mut()
