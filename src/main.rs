@@ -12,19 +12,16 @@ fn main() -> color_eyre::Result<()> {
     let my_id = last_id.clone();
     ctrlc::set_handler(move || {
         let id = my_id.load(Ordering::Relaxed);
-        let _ = id::save(id);
+
+        if let Err(report) = id::save(id) {
+            eprintln!("Failed to save ID: {report}");
+        }
 
         std::process::exit(0);
     })
     .unwrap();
 
-    let mut outcome = app::run(&token, last_id.clone());
-
-    if let Err(save_fail) = id::save(last_id.load(Ordering::Relaxed)) {
-        outcome = outcome.map_err(|report| report.wrap_err(save_fail));
-    }
-
-    outcome.wrap_err("Failed to run")
+    app::run(&token, last_id.clone()).wrap_err("Failed to run")
 }
 
 mod app {
@@ -34,7 +31,7 @@ mod app {
 
     use color_eyre::eyre::Context as _;
 
-    use crate::repositories;
+    use crate::{id, repositories};
 
     pub(crate) fn run(token: &str, last_id: Arc<AtomicU64>) -> color_eyre::Result<()> {
         let mut json = std::fs::File::options()
@@ -67,6 +64,7 @@ mod app {
                 json.write_all(b"\n").wrap_err("Failed to write newline")?;
 
                 last_id.store(id, Ordering::Relaxed);
+                id::save(id).wrap_err("Failed to save ID")?;
             }
         }
     }
@@ -317,6 +315,7 @@ mod types {
     pub(crate) struct GraphRepository {
         pub(crate) id: String,
         pub(crate) name_with_owner: String,
+        pub(crate) stargazer_count: u64,
         pub(crate) default_branch_ref: Option<GraphRef>,
         pub(crate) languages: GraphLanguages,
     }

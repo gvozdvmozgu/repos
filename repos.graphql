@@ -3,6 +3,7 @@ query($ids: [ID!]!) {
         ... on Repository {
             id
             nameWithOwner
+            stargazerCount
             defaultBranchRef {
                 name
             }
