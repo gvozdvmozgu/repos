@@ -544,6 +544,7 @@ dependencies = [
  "base64",
  "color-eyre",
  "ctrlc",
+ "http",
  "itoa",
  "serde",
  "serde_json",

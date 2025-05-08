@@ -50,6 +50,8 @@ mod app {
                 .wrap_err("Failed to fetch repositories")?;
 
             for batch in repos.chunks(REPOS_PER_BATCH) {
+                eprintln!("Fetched {} repositories", batch.len());
+
                 let ids = batch
                     .iter()
                     .map(|repo| repo.node_id.as_str())
@@ -95,6 +97,8 @@ mod id {
 }
 
 mod repositories {
+    use std::time::Duration;
+
     use color_eyre::eyre::Context as _;
 
     use crate::types;
@@ -147,11 +151,34 @@ mod repositories {
         Some((prefix, type_name, numeric_id))
     }
 
+    fn retry<T>(
+        call: impl Fn() -> Result<http::Response<T>, ureq::Error>,
+    ) -> Result<http::Response<T>, ureq::Error> {
+        let mut wait = Duration::from_secs(10);
+        let mut attempts = 0;
+
+        loop {
+            match call() {
+                Ok(response) => return Ok(response),
+                Err(error) if attempts < 5 => {
+                    std::thread::sleep(wait);
+                    attempts += 1;
+                    wait *= 2;
+
+                    eprintln!("Retrying request: {error}\nAttempt {attempts}\nWait time: {wait:?}");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub(crate) fn fetch(token: &str, last_id: u64) -> color_eyre::Result<Vec<types::Repo>> {
-        let mut buffer = itoa::Buffer::new();
-        let mut response = request!(get, token, "repositories")
-            .query("since", buffer.format(last_id))
-            .call()?;
+        let mut response = retry(|| {
+            let mut buffer = itoa::Buffer::new();
+            request!(get, token, "repositories")
+                .query("since", buffer.format(last_id))
+                .call()
+        })?;
 
         response
             .body_mut()
@@ -163,9 +190,11 @@ mod repositories {
         token: &str,
         ids: &[&str],
     ) -> color_eyre::Result<Vec<Option<types::GraphRepository>>> {
-        let mut response = request!(post, token, "graphql").send_json(
-            serde_json::json!({"query": GRAPHQL_QUERY_REPOSITORIES, "variables": {"ids": ids}}),
-        )?;
+        let mut response = retry(|| {
+            request!(post, token, "graphql").send_json(
+                serde_json::json!({"query": GRAPHQL_QUERY_REPOSITORIES, "variables": {"ids": ids}}),
+            )
+        })?;
 
         let response: types::GraphResponse = response
             .body_mut()
