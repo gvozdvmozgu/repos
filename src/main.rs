@@ -1,7 +1,5 @@
 #![warn(unreachable_pub, unused_qualifications)]
 
-const REPOS_PER_BATCH: usize = 100;
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -36,7 +34,7 @@ mod app {
 
     use color_eyre::eyre::Context as _;
 
-    use crate::{REPOS_PER_BATCH, repositories};
+    use crate::repositories;
 
     pub(crate) fn run(token: &str, last_id: Arc<AtomicU64>) -> color_eyre::Result<()> {
         let mut json = std::fs::File::options()
@@ -49,30 +47,26 @@ mod app {
             let repos = repositories::fetch(token, last_id.load(Ordering::Relaxed))
                 .wrap_err("Failed to fetch repositories")?;
 
-            for batch in repos.chunks(REPOS_PER_BATCH) {
-                eprintln!("Fetched {} repositories", batch.len());
+            let ids = repos
+                .iter()
+                .map(|repo| repo.node_id.as_str())
+                .collect::<Vec<_>>();
 
-                let ids = batch
-                    .iter()
-                    .map(|repo| repo.node_id.as_str())
-                    .collect::<Vec<_>>();
+            let graph_repos = repositories::info(token, &ids)
+                .wrap_err("Failed to fetch repository info")?
+                .into_iter()
+                .flatten();
 
-                let graph_repos = repositories::info(token, &ids)
-                    .wrap_err("Failed to fetch repository info")?
-                    .into_iter()
-                    .flatten();
+            for repo in graph_repos {
+                let (_, _, id) =
+                    repositories::parse_node_id(&repo.id).expect("Invalid node_id format");
 
-                for repo in graph_repos {
-                    let (_, _, id) =
-                        repositories::parse_node_id(&repo.id).expect("Invalid node_id format");
+                let serialized = serde_json::to_string(&repo).unwrap();
+                json.write_all(serialized.as_bytes())
+                    .wrap_err("Failed to write repository info to file")?;
+                json.write_all(b"\n").wrap_err("Failed to write newline")?;
 
-                    let serialized = serde_json::to_string(&repo).unwrap();
-                    json.write_all(serialized.as_bytes())
-                        .wrap_err("Failed to write repository info to file")?;
-                    json.write_all(b"\n").wrap_err("Failed to write newline")?;
-
-                    last_id.store(id, Ordering::Relaxed);
-                }
+                last_id.store(id, Ordering::Relaxed);
             }
         }
     }
