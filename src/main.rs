@@ -75,7 +75,7 @@ mod id {
 
     pub(crate) fn load() -> color_eyre::Result<u64> {
         match std::fs::read_to_string("id") {
-            Ok(text) => text.parse().wrap_err("Failed to parse ID"),
+            Ok(text) => text.trim().parse().wrap_err("Failed to parse ID"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
             Err(error) => color_eyre::eyre::bail!("Failed to read file: {error}"),
         }
