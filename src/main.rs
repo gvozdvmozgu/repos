@@ -315,7 +315,7 @@ mod types {
     pub(crate) struct GraphRepository {
         pub(crate) id: String,
         pub(crate) name_with_owner: String,
-        pub(crate) stargazer_count: u64,
+        pub(crate) stargazer_count: i64,
         pub(crate) default_branch_ref: Option<GraphRef>,
         pub(crate) languages: GraphLanguages,
     }
