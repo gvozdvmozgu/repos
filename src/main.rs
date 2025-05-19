@@ -66,6 +66,15 @@ mod app {
                 last_id.store(id, Ordering::Relaxed);
                 id::save(id).wrap_err("Failed to save ID")?;
             }
+
+            if repos.is_empty() {
+                eprintln!("No new repositories found");
+                break Ok(());
+            }
+
+            let id = repos.last().unwrap().id;
+            last_id.store(id, Ordering::Relaxed);
+            id::save(id).wrap_err("Failed to save ID")?;
         }
     }
 }
@@ -192,6 +201,10 @@ mod repositories {
             .body_mut()
             .read_json()
             .wrap_err("Failed to read JSON")?;
+
+        for err in response.errors.iter().flatten() {
+            eprintln!("GraphQL error: {}", err.message);
+        }
 
         if let Some(data) = response.data {
             Ok(data.nodes)
