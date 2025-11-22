@@ -1,52 +1,56 @@
 #![warn(unreachable_pub, unused_qualifications)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use color_eyre::eyre::Context as _;
 
-fn main() -> color_eyre::Result<()> {
-    let last_id = Arc::new(AtomicU64::new(id::load()?));
+#[tokio::main]
+async fn main() -> color_eyre::Result<()> {
+    let initial_id = id::load().await?;
+    let last_id = Arc::new(id::Tracker::new(initial_id));
     let token = env::required::<String>("GITHUB_TOKEN")?;
-    let client = repositories::GitHubClient::new(token);
+    let client = repositories::GitHubClient::new(token)?;
 
-    let my_id = last_id.clone();
-    ctrlc::set_handler(move || {
-        let id = my_id.load(Ordering::Relaxed);
-
-        if let Err(report) = id::save(id) {
-            eprintln!("Failed to save ID: {report}");
+    let shutdown_id = last_id.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let id = shutdown_id.current();
+            if let Err(report) = shutdown_id.persist(id).await {
+                eprintln!("Failed to save ID: {report}");
+            }
+            std::process::exit(0);
         }
+    });
 
-        std::process::exit(0);
-    })
-    .unwrap();
-
-    app::run(&client, last_id.clone()).wrap_err("Failed to run")
+    app::run(&client, last_id.clone())
+        .await
+        .wrap_err("Failed to run")
 }
 
 mod app {
-    use std::io::{BufWriter, Write};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use color_eyre::eyre::Context as _;
+    use tokio::fs::OpenOptions;
+    use tokio::io::{AsyncWriteExt, BufWriter};
 
     use crate::{id, repositories, types};
 
-    pub(crate) fn run(
+    pub(crate) async fn run(
         client: &repositories::GitHubClient,
-        last_id: Arc<AtomicU64>,
+        last_id: Arc<id::Tracker>,
     ) -> color_eyre::Result<()> {
-        let file = std::fs::File::options()
+        let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open("repos.jsonl")
+            .await
             .wrap_err("Failed to open repos.jsonl")?;
         let mut json = BufWriter::new(file);
 
         loop {
-            let repos = repositories::fetch(client, last_id.load(Ordering::Relaxed))
+            let repos = repositories::fetch(client, last_id.current())
+                .await
                 .wrap_err("Failed to fetch repositories")?;
 
             if repos.is_empty() {
@@ -59,67 +63,138 @@ mod app {
                 .map(|repo| repo.node_id.as_str())
                 .collect::<Vec<_>>();
 
-            let graph_repos = repositories::info(client, &ids)
-                .wrap_err("Failed to fetch repository info")?
-                .into_iter()
-                .flatten();
+            let graph_repos = fetch_graph_repositories(client, &ids, repos.len()).await?;
+            let last_written_id = match write_graph_repositories(&mut json, graph_repos).await? {
+                Some(id) => id,
+                None => {
+                    eprintln!(
+                        "GraphQL returned zero nodes for REST page size {}; not advancing ID",
+                        repos.len()
+                    );
+                    json.flush().await.wrap_err("Failed to flush repos.jsonl")?;
+                    continue;
+                }
+            };
 
-            for repo in graph_repos {
-                let (_, _, id) =
-                    repositories::parse_node_id(&repo.id).expect("Invalid node_id format");
-
-                write_repo(&mut json, &repo)?;
-                persist_id(&last_id, id).wrap_err("Failed to save ID")?;
-            }
-
-            let id = repos.last().unwrap().id;
-            persist_id(&last_id, id).wrap_err("Failed to save ID")?;
-            json.flush().wrap_err("Failed to flush repos.jsonl")?;
+            last_id
+                .persist(last_written_id)
+                .await
+                .wrap_err("Failed to save ID")?;
+            json.flush().await.wrap_err("Failed to flush repos.jsonl")?;
         }
     }
 
-    fn write_repo(
-        writer: &mut BufWriter<std::fs::File>,
+    pub(crate) async fn fetch_graph_repositories<'a>(
+        client: &repositories::GitHubClient,
+        ids: &[&'a str],
+        rest_count: usize,
+    ) -> color_eyre::Result<Vec<types::GraphRepository>> {
+        let graph_repos = repositories::info(client, ids)
+            .await
+            .wrap_err("Failed to fetch repository info")?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        if graph_repos.len() < rest_count {
+            eprintln!(
+                "GraphQL returned fewer nodes ({}) than REST page ({}); \
+                 advancing to last written GraphQL repo only",
+                graph_repos.len(),
+                rest_count
+            );
+        }
+
+        Ok(graph_repos)
+    }
+
+    pub(crate) async fn write_graph_repositories(
+        writer: &mut BufWriter<tokio::fs::File>,
+        graph_repos: Vec<types::GraphRepository>,
+    ) -> color_eyre::Result<Option<u64>> {
+        let mut last_written_id = None;
+
+        for repo in graph_repos {
+            let (_, _, id) = repositories::parse_node_id(&repo.id).expect("Invalid node_id format");
+            write_repo(writer, &repo).await?;
+            last_written_id = Some(id);
+        }
+
+        Ok(last_written_id)
+    }
+
+    async fn write_repo(
+        writer: &mut BufWriter<tokio::fs::File>,
         repo: &types::GraphRepository,
     ) -> color_eyre::Result<()> {
         let serialized = serde_json::to_string(repo).wrap_err("Failed to serialize repository")?;
         writer
             .write_all(serialized.as_bytes())
+            .await
             .wrap_err("Failed to write repository info to file")?;
         writer
             .write_all(b"\n")
+            .await
             .wrap_err("Failed to write newline")?;
         Ok(())
-    }
-
-    fn persist_id(last_id: &Arc<AtomicU64>, id: u64) -> color_eyre::Result<()> {
-        last_id.store(id, Ordering::Relaxed);
-        id::save(id)
     }
 }
 
 mod id {
-    use color_eyre::eyre::Context as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    pub(crate) fn load() -> color_eyre::Result<u64> {
-        match std::fs::read_to_string("id") {
+    use color_eyre::eyre::Context as _;
+    use tokio::fs;
+    use tokio::sync::Mutex;
+
+    pub(crate) struct Tracker {
+        current: AtomicU64,
+        lock: Mutex<()>,
+    }
+
+    impl Tracker {
+        pub(crate) fn new(initial: u64) -> Self {
+            Self {
+                current: AtomicU64::new(initial),
+                lock: Mutex::new(()),
+            }
+        }
+
+        pub(crate) fn current(&self) -> u64 {
+            self.current.load(Ordering::Relaxed)
+        }
+
+        pub(crate) async fn persist(&self, id: u64) -> color_eyre::Result<()> {
+            let _guard = self.lock.lock().await;
+            self.current.store(id, Ordering::Relaxed);
+            save(id).await
+        }
+    }
+
+    pub(crate) async fn load() -> color_eyre::Result<u64> {
+        match fs::read_to_string("id").await {
             Ok(text) => text.trim().parse().wrap_err("Failed to parse ID"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
             Err(error) => color_eyre::eyre::bail!("Failed to read file: {error}"),
         }
     }
 
-    pub(crate) fn save(id: u64) -> color_eyre::Result<()> {
+    pub(crate) async fn save(id: u64) -> color_eyre::Result<()> {
         let mut buffer = itoa::Buffer::new();
-        std::fs::write("id", buffer.format(id)).wrap_err("Failed to write ID")?;
+        fs::write("id", buffer.format(id))
+            .await
+            .wrap_err("Failed to write ID")?;
         Ok(())
     }
 }
 
 mod repositories {
+    use std::future::Future;
     use std::time::Duration;
 
     use color_eyre::eyre::Context as _;
+    use reqwest::{Url, header};
+    use tokio::time::sleep;
 
     use crate::types;
 
@@ -129,27 +204,33 @@ mod repositories {
 
     #[derive(Clone)]
     pub(crate) struct GitHubClient {
-        token: String,
+        http: reqwest::Client,
+        base: Url,
     }
 
     impl GitHubClient {
-        pub(crate) fn new(token: impl Into<String>) -> Self {
-            Self {
-                token: token.into(),
-            }
+        pub(crate) fn new(token: impl Into<String>) -> color_eyre::Result<Self> {
+            let token = token.into();
+            let mut headers = header::HeaderMap::new();
+            let auth = header::HeaderValue::from_str(&format!("token {}", token))
+                .wrap_err("Invalid GitHub token header value")?;
+            headers.insert(header::AUTHORIZATION, auth);
+
+            let http = reqwest::Client::builder()
+                .user_agent(USER_AGENT)
+                .default_headers(headers)
+                .build()
+                .wrap_err("Failed to build reqwest client")?;
+
+            let base = Url::parse(GITHUB_API).wrap_err("Invalid GitHub API base URL")?;
+
+            Ok(Self { http, base })
         }
 
-        fn url(&self, path: &str) -> String {
-            format!("{GITHUB_API}{path}")
-        }
-
-        fn with_defaults<B>(
-            &self,
-            request: ureq::RequestBuilder<B>,
-        ) -> ureq::RequestBuilder<B> {
-            request
-                .header("authorization", &format!("token {}", self.token))
-                .header("user-agent", USER_AGENT)
+        fn url(&self, path: &str) -> Url {
+            self.base
+                .join(path)
+                .expect("Failed to join GitHub API path")
         }
     }
 
@@ -172,16 +253,18 @@ mod repositories {
         Some((prefix, type_name, numeric_id))
     }
 
-    fn retry(
-        mut call: impl FnMut() -> Result<http::Response<ureq::Body>, ureq::Error>,
-    ) -> Result<http::Response<ureq::Body>, ureq::Error> {
+    async fn retry<F, Fut>(mut call: F) -> reqwest::Result<reqwest::Response>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = reqwest::Result<reqwest::Response>>,
+    {
         let mut wait = Duration::from_secs(10);
 
         for attempt in 0..=5 {
-            match call() {
+            match call().await {
                 Ok(response) => return Ok(response),
                 Err(error) if attempt < 5 => {
-                    std::thread::sleep(wait);
+                    sleep(wait).await;
                     eprintln!(
                         "Retrying request: {error}\nAttempt {}\nWait time: {wait:?}",
                         attempt + 1
@@ -195,41 +278,52 @@ mod repositories {
         unreachable!("Retry loop should always return")
     }
 
-    pub(crate) fn fetch(
+    pub(crate) async fn fetch(
         client: &GitHubClient,
         last_id: u64,
     ) -> color_eyre::Result<Vec<types::Repo>> {
-        let mut response = retry(|| {
+        let response = retry(|| {
             let mut buffer = itoa::Buffer::new();
-            client
-                .with_defaults(ureq::get(&client.url("repositories")))
-                .query("since", buffer.format(last_id))
-                .call()
-        })?;
+            let url = client.url("repositories");
 
-        response
-            .body_mut()
-            .read_json()
-            .wrap_err("Failed to read JSON")
+            async move {
+                client
+                    .http
+                    .get(url)
+                    .query(&[("since", buffer.format(last_id))])
+                    .send()
+                    .await
+            }
+        })
+        .await?;
+
+        response.json().await.wrap_err("Failed to read JSON")
     }
 
-    pub(crate) fn info(
+    pub(crate) async fn info(
         client: &GitHubClient,
         ids: &[&str],
     ) -> color_eyre::Result<Vec<Option<types::GraphRepository>>> {
-        let mut response = retry(|| {
-            client
-                .with_defaults(ureq::post(&client.url("graphql")))
-                .send_json(serde_json::json!({
-                    "query": GRAPHQL_QUERY_REPOSITORIES,
-                    "variables": {"ids": ids}
-                }))
-        })?;
+        let response = retry(|| {
+            let url = client.url("graphql");
+            let ids = ids.to_owned();
 
-        let response: types::GraphResponse = response
-            .body_mut()
-            .read_json()
-            .wrap_err("Failed to read JSON")?;
+            async move {
+                client
+                    .http
+                    .post(url)
+                    .json(&serde_json::json!({
+                        "query": GRAPHQL_QUERY_REPOSITORIES,
+                        "variables": {"ids": ids}
+                    }))
+                    .send()
+                    .await
+            }
+        })
+        .await?;
+
+        let response: types::GraphResponse =
+            response.json().await.wrap_err("Failed to read JSON")?;
 
         for err in response.errors.iter().flatten() {
             eprintln!("GraphQL error: {}", err.message);
@@ -405,26 +499,38 @@ mod tests {
     use std::sync::{Mutex, MutexGuard};
 
     use base64::Engine as _;
+    use tokio::fs::OpenOptions;
+    use tokio::io::AsyncWriteExt;
 
-    use super::{env, id, repositories};
+    use super::{app, env, id, repositories, types};
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static WORKDIR_LOCK: Mutex<()> = Mutex::new(());
 
     struct TempDirGuard {
         old_dir: PathBuf,
         path: PathBuf,
+        _lock: MutexGuard<'static, ()>,
     }
 
     impl TempDirGuard {
         fn new() -> std::io::Result<Self> {
+            let lock = WORKDIR_LOCK.lock().unwrap();
             let old_dir = std::env::current_dir()?;
             let path = std::env::temp_dir().join(format!(
                 "repos-test-{}",
                 TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
+            if path.exists() {
+                let _ = fs::remove_dir_all(&path);
+            }
             fs::create_dir(&path)?;
             std::env::set_current_dir(&path)?;
-            Ok(Self { old_dir, path })
+            Ok(Self {
+                old_dir,
+                path,
+                _lock: lock,
+            })
         }
     }
 
@@ -480,8 +586,7 @@ mod tests {
 
     #[test]
     fn parse_node_id_decodes_fields() {
-        let encoded = base64::engine::general_purpose::STANDARD
-            .encode("01:Repository12345");
+        let encoded = base64::engine::general_purpose::STANDARD.encode("01:Repository12345");
         let (prefix, kind, id) =
             repositories::parse_node_id(&encoded).expect("should decode valid node id");
 
@@ -501,9 +606,12 @@ mod tests {
     fn id_load_and_save_roundtrip() {
         let _dir = TempDirGuard::new().expect("failed to create temp dir");
 
-        assert_eq!(id::load().unwrap(), 0);
-        id::save(42).unwrap();
-        assert_eq!(id::load().unwrap(), 42);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            assert_eq!(id::load().await.unwrap(), 0);
+            id::save(42).await.unwrap();
+            assert_eq!(id::load().await.unwrap(), 42);
+        });
     }
 
     #[test]
@@ -515,5 +623,93 @@ mod tests {
 
         let _set = EnvGuard::set("TEST_ENV_REQUIRED", "123");
         assert_eq!(env::required::<u64>("TEST_ENV_REQUIRED").unwrap(), 123);
+    }
+
+    #[test]
+    fn write_graph_repositories_tracks_last_id_and_writes_lines() {
+        let _dir = TempDirGuard::new().expect("failed to create temp dir");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(async {
+            let repo_a = sample_repo(1, "owner/repo-a");
+            let repo_b = sample_repo(2, "owner/repo-b");
+
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("repos.jsonl")
+                .await
+                .unwrap();
+            let mut writer = tokio::io::BufWriter::new(file);
+
+            let last = app::write_graph_repositories(&mut writer, vec![repo_a, repo_b])
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+
+            assert_eq!(last, Some(2));
+
+            let contents = tokio::fs::read_to_string("repos.jsonl").await.unwrap();
+            let lines: Vec<_> = contents.lines().collect();
+            assert_eq!(lines.len(), 2);
+        });
+    }
+
+    #[test]
+    fn write_graph_repositories_handles_empty_input() {
+        let _dir = TempDirGuard::new().expect("failed to create temp dir");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(async {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("repos.jsonl")
+                .await
+                .unwrap();
+            let mut writer = tokio::io::BufWriter::new(file);
+
+            let last = app::write_graph_repositories(&mut writer, Vec::new())
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+
+            assert!(last.is_none());
+            let contents = tokio::fs::read_to_string("repos.jsonl").await.unwrap();
+            assert!(contents.is_empty());
+        });
+    }
+
+    #[test]
+    fn tracker_persist_serializes_id() {
+        let _dir = TempDirGuard::new().expect("failed to create temp dir");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(async {
+            let tracker = id::Tracker::new(0);
+            tracker.persist(99).await.unwrap();
+            assert_eq!(tracker.current(), 99);
+
+            let from_file = id::load().await.unwrap();
+            assert_eq!(from_file, 99);
+        });
+    }
+
+    fn sample_repo(id: u64, name: &str) -> types::GraphRepository {
+        let encoded_id =
+            base64::engine::general_purpose::STANDARD.encode(format!("01:Repository{id}"));
+        types::GraphRepository {
+            id: encoded_id,
+            name_with_owner: name.to_string(),
+            stargazer_count: 0,
+            default_branch_ref: Some(types::GraphRef {
+                name: "main".to_string(),
+            }),
+            languages: types::GraphLanguages {
+                nodes: vec![Some(types::GraphLanguage {
+                    name: "Rust".to_string(),
+                })],
+            },
+        }
     }
 }
