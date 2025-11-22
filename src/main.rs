@@ -8,6 +8,7 @@ use color_eyre::eyre::Context as _;
 fn main() -> color_eyre::Result<()> {
     let last_id = Arc::new(AtomicU64::new(id::load()?));
     let token = env::required::<String>("GITHUB_TOKEN")?;
+    let client = repositories::GitHubClient::new(token);
 
     let my_id = last_id.clone();
     ctrlc::set_handler(move || {
@@ -21,35 +22,44 @@ fn main() -> color_eyre::Result<()> {
     })
     .unwrap();
 
-    app::run(&token, last_id.clone()).wrap_err("Failed to run")
+    app::run(&client, last_id.clone()).wrap_err("Failed to run")
 }
 
 mod app {
-    use std::io::Write;
+    use std::io::{BufWriter, Write};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use color_eyre::eyre::Context as _;
 
-    use crate::{id, repositories};
+    use crate::{id, repositories, types};
 
-    pub(crate) fn run(token: &str, last_id: Arc<AtomicU64>) -> color_eyre::Result<()> {
-        let mut json = std::fs::File::options()
+    pub(crate) fn run(
+        client: &repositories::GitHubClient,
+        last_id: Arc<AtomicU64>,
+    ) -> color_eyre::Result<()> {
+        let file = std::fs::File::options()
             .create(true)
             .append(true)
             .open("repos.jsonl")
             .wrap_err("Failed to open repos.jsonl")?;
+        let mut json = BufWriter::new(file);
 
         loop {
-            let repos = repositories::fetch(token, last_id.load(Ordering::Relaxed))
+            let repos = repositories::fetch(client, last_id.load(Ordering::Relaxed))
                 .wrap_err("Failed to fetch repositories")?;
+
+            if repos.is_empty() {
+                eprintln!("No new repositories found");
+                break Ok(());
+            }
 
             let ids = repos
                 .iter()
                 .map(|repo| repo.node_id.as_str())
                 .collect::<Vec<_>>();
 
-            let graph_repos = repositories::info(token, &ids)
+            let graph_repos = repositories::info(client, &ids)
                 .wrap_err("Failed to fetch repository info")?
                 .into_iter()
                 .flatten();
@@ -58,24 +68,33 @@ mod app {
                 let (_, _, id) =
                     repositories::parse_node_id(&repo.id).expect("Invalid node_id format");
 
-                let serialized = serde_json::to_string(&repo).unwrap();
-                json.write_all(serialized.as_bytes())
-                    .wrap_err("Failed to write repository info to file")?;
-                json.write_all(b"\n").wrap_err("Failed to write newline")?;
-
-                last_id.store(id, Ordering::Relaxed);
-                id::save(id).wrap_err("Failed to save ID")?;
-            }
-
-            if repos.is_empty() {
-                eprintln!("No new repositories found");
-                break Ok(());
+                write_repo(&mut json, &repo)?;
+                persist_id(&last_id, id).wrap_err("Failed to save ID")?;
             }
 
             let id = repos.last().unwrap().id;
-            last_id.store(id, Ordering::Relaxed);
-            id::save(id).wrap_err("Failed to save ID")?;
+            persist_id(&last_id, id).wrap_err("Failed to save ID")?;
+            json.flush().wrap_err("Failed to flush repos.jsonl")?;
         }
+    }
+
+    fn write_repo(
+        writer: &mut BufWriter<std::fs::File>,
+        repo: &types::GraphRepository,
+    ) -> color_eyre::Result<()> {
+        let serialized = serde_json::to_string(repo).wrap_err("Failed to serialize repository")?;
+        writer
+            .write_all(serialized.as_bytes())
+            .wrap_err("Failed to write repository info to file")?;
+        writer
+            .write_all(b"\n")
+            .wrap_err("Failed to write newline")?;
+        Ok(())
+    }
+
+    fn persist_id(last_id: &Arc<AtomicU64>, id: u64) -> color_eyre::Result<()> {
+        last_id.store(id, Ordering::Relaxed);
+        id::save(id)
     }
 }
 
@@ -105,32 +124,33 @@ mod repositories {
     use crate::types;
 
     const GITHUB_API: &str = "https://api.github.com/";
+    const USER_AGENT: &str = "https://github.com/gvozdvmozgu/repos";
     const GRAPHQL_QUERY_REPOSITORIES: &str = include_str!("../repos.graphql");
 
-    macro_rules! request {
-        (get, $token:expr, $path:expr $(, $call:ident ( $($args:tt)* ) )* ) => {{
-            let mut req = ureq::get(&format!("{}{}", GITHUB_API, $path));
+    #[derive(Clone)]
+    pub(crate) struct GitHubClient {
+        token: String,
+    }
 
-            req = req
-                .header("authorization", &format!("token {}", $token))
-                .header("user-agent", "https://github.com/gvozdvmozgu/repos");
+    impl GitHubClient {
+        pub(crate) fn new(token: impl Into<String>) -> Self {
+            Self {
+                token: token.into(),
+            }
+        }
 
-            $(
-                req = req.$call($($args)*);
-            )*
-            req
-        }};
+        fn url(&self, path: &str) -> String {
+            format!("{GITHUB_API}{path}")
+        }
 
-        (post, $token:expr, $path:expr $(, $call:ident ( $($args:tt)* ) )* ) => {{
-            let mut req = ureq::post(&format!("{}{}", GITHUB_API, $path));
-            req = req
-                .header("authorization", &format!("token {}", $token))
-                .header("user-agent", "https://github.com/gvozdvmozgu/repos");
-            $(
-                req = req.$call($($args)*);
-            )*
-            req
-        }};
+        fn with_defaults<B>(
+            &self,
+            request: ureq::RequestBuilder<B>,
+        ) -> ureq::RequestBuilder<B> {
+            request
+                .header("authorization", &format!("token {}", self.token))
+                .header("user-agent", USER_AGENT)
+        }
     }
 
     pub(crate) fn parse_node_id(encoded: &str) -> Option<(String, String, u64)> {
@@ -152,31 +172,37 @@ mod repositories {
         Some((prefix, type_name, numeric_id))
     }
 
-    fn retry<T>(
-        call: impl Fn() -> Result<http::Response<T>, ureq::Error>,
-    ) -> Result<http::Response<T>, ureq::Error> {
+    fn retry(
+        mut call: impl FnMut() -> Result<http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<http::Response<ureq::Body>, ureq::Error> {
         let mut wait = Duration::from_secs(10);
-        let mut attempts = 0;
 
-        loop {
+        for attempt in 0..=5 {
             match call() {
                 Ok(response) => return Ok(response),
-                Err(error) if attempts < 5 => {
+                Err(error) if attempt < 5 => {
                     std::thread::sleep(wait);
-                    attempts += 1;
+                    eprintln!(
+                        "Retrying request: {error}\nAttempt {}\nWait time: {wait:?}",
+                        attempt + 1
+                    );
                     wait *= 2;
-
-                    eprintln!("Retrying request: {error}\nAttempt {attempts}\nWait time: {wait:?}");
                 }
                 Err(error) => return Err(error),
-            }
+            };
         }
+
+        unreachable!("Retry loop should always return")
     }
 
-    pub(crate) fn fetch(token: &str, last_id: u64) -> color_eyre::Result<Vec<types::Repo>> {
+    pub(crate) fn fetch(
+        client: &GitHubClient,
+        last_id: u64,
+    ) -> color_eyre::Result<Vec<types::Repo>> {
         let mut response = retry(|| {
             let mut buffer = itoa::Buffer::new();
-            request!(get, token, "repositories")
+            client
+                .with_defaults(ureq::get(&client.url("repositories")))
                 .query("since", buffer.format(last_id))
                 .call()
         })?;
@@ -188,13 +214,16 @@ mod repositories {
     }
 
     pub(crate) fn info(
-        token: &str,
+        client: &GitHubClient,
         ids: &[&str],
     ) -> color_eyre::Result<Vec<Option<types::GraphRepository>>> {
         let mut response = retry(|| {
-            request!(post, token, "graphql").send_json(
-                serde_json::json!({"query": GRAPHQL_QUERY_REPOSITORIES, "variables": {"ids": ids}}),
-            )
+            client
+                .with_defaults(ureq::post(&client.url("graphql")))
+                .send_json(serde_json::json!({
+                    "query": GRAPHQL_QUERY_REPOSITORIES,
+                    "variables": {"ids": ids}
+                }))
         })?;
 
         let response: types::GraphResponse = response
@@ -365,5 +394,126 @@ mod env {
                     color_eyre::eyre::eyre!("Failed to parse {key} environment variable: {error}")
                 })
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+
+    use base64::Engine as _;
+
+    use super::{env, id, repositories};
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDirGuard {
+        old_dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TempDirGuard {
+        fn new() -> std::io::Result<Self> {
+            let old_dir = std::env::current_dir()?;
+            let path = std::env::temp_dir().join(format!(
+                "repos-test-{}",
+                TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path)?;
+            std::env::set_current_dir(&path)?;
+            Ok(Self { old_dir, path })
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.old_dir);
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        key: String,
+        prev: Option<String>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &str, value: &str) -> Self {
+            let lock = ENV_LOCK.lock().unwrap();
+            let prev = std::env::var(key).ok();
+            // Environment mutation is globally unsafe; we serialize access via a mutex.
+            unsafe { std::env::set_var(key, value) };
+            Self {
+                key: key.to_string(),
+                prev,
+                _lock: lock,
+            }
+        }
+
+        fn unset(key: &str) -> Self {
+            let lock = ENV_LOCK.lock().unwrap();
+            let prev = std::env::var(key).ok();
+            unsafe { std::env::remove_var(key) };
+            Self {
+                key: key.to_string(),
+                prev,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = &self.prev {
+                unsafe { std::env::set_var(&self.key, prev) };
+            } else {
+                unsafe { std::env::remove_var(&self.key) };
+            }
+        }
+    }
+
+    #[test]
+    fn parse_node_id_decodes_fields() {
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode("01:Repository12345");
+        let (prefix, kind, id) =
+            repositories::parse_node_id(&encoded).expect("should decode valid node id");
+
+        assert_eq!(prefix, "01");
+        assert_eq!(kind, "Repository");
+        assert_eq!(id, 12345);
+    }
+
+    #[test]
+    fn parse_node_id_rejects_invalid() {
+        assert!(repositories::parse_node_id("not-base64").is_none());
+        let encoded = base64::engine::general_purpose::STANDARD.encode("missing_number");
+        assert!(repositories::parse_node_id(&encoded).is_none());
+    }
+
+    #[test]
+    fn id_load_and_save_roundtrip() {
+        let _dir = TempDirGuard::new().expect("failed to create temp dir");
+
+        assert_eq!(id::load().unwrap(), 0);
+        id::save(42).unwrap();
+        assert_eq!(id::load().unwrap(), 42);
+    }
+
+    #[test]
+    fn env_required_handles_presence_and_absence() {
+        {
+            let _unset = EnvGuard::unset("TEST_ENV_REQUIRED");
+            assert!(env::required::<u64>("TEST_ENV_REQUIRED").is_err());
+        }
+
+        let _set = EnvGuard::set("TEST_ENV_REQUIRED", "123");
+        assert_eq!(env::required::<u64>("TEST_ENV_REQUIRED").unwrap(), 123);
     }
 }
